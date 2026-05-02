@@ -1,9 +1,25 @@
 import os
 import sqlite3
+import logging
 import requests
 from flask import Flask, request, jsonify, render_template, g
+# CORS handled manually via after_request
+
+# --- Logging setup ---
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="[%(asctime)s] %(levelname)s: %(message)s"
+)
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# Add CORS headers to every response
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Token"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
 # --- Config ---
 API_KEY     = os.environ.get("SMM_API_KEY")
@@ -12,13 +28,13 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
 SMM_API_URL = "https://smmvault.in/api/v2"
 DATABASE    = "smm_panel.db"
 
-# Fail fast if critical env vars are missing
+# Warn but don't crash on startup — lets Railway at least serve the frontend
 if not API_KEY:
-    raise RuntimeError("SMM_API_KEY environment variable is not set.")
+    log.warning("SMM_API_KEY is not set. Order placement will fail.")
 if not SERVICE_ID:
-    raise RuntimeError("SMM_SERVICE_ID environment variable is not set.")
+    log.warning("SMM_SERVICE_ID is not set. Order placement will fail.")
 if not ADMIN_TOKEN:
-    raise RuntimeError("ADMIN_TOKEN environment variable is not set.")
+    log.warning("ADMIN_TOKEN is not set. Admin routes will be inaccessible.")
 
 # --- Status normalization ---
 STATUS_MAP = {
@@ -35,12 +51,29 @@ STATUS_MAP = {
 def normalize_status(raw):
     return STATUS_MAP.get((raw or "").strip().lower(), "pending")
 
+# --- Safe JSON body parser ---
+def get_json_body():
+    """Safely parse JSON body regardless of Content-Type header."""
+    # Try get_json first (strict), then force=True as fallback
+    data = request.get_json(silent=True)
+    if data is None:
+        data = request.get_json(force=True, silent=True)
+    if data is None:
+        # Last resort: parse raw data manually
+        try:
+            import json
+            data = json.loads(request.data.decode("utf-8"))
+        except Exception:
+            data = {}
+    return data or {}
+
 # --- DB helpers ---
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
         db = g._database = sqlite3.connect(DATABASE)
         db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")  # Better concurrent access
     return db
 
 @app.teardown_appcontext
@@ -69,6 +102,18 @@ def init_db():
             )
         """)
         db.commit()
+        log.info("Database initialized successfully.")
+
+# Init DB at module level — works with gunicorn (Railway) and direct python run
+try:
+    init_db()
+except Exception as e:
+    log.error(f"DB init failed: {e}")
+
+# --- Health check (useful for Railway) ---
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"}), 200
 
 # --- Pages ---
 @app.route("/")
@@ -78,192 +123,235 @@ def index():
 # --- User / Balance API ---
 @app.route("/api/user", methods=["POST"])
 def get_or_create_user():
-    data = request.json or {}
-    user_id = (data.get("user_id") or "").strip()
-    if not user_id:
-        return jsonify({"error": "user_id is required"}), 400
+    try:
+        data    = get_json_body()
+        user_id = (data.get("user_id") or "").strip()
+        log.debug(f"[/api/user] Received body: {data}")
 
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    if not user:
-        db.execute("INSERT INTO users (id, balance) VALUES (?, 0)", (user_id,))
-        db.commit()
-        balance = 0
-    else:
-        balance = user["balance"]
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
 
-    return jsonify({"user_id": user_id, "balance": balance})
+        db   = get_db()
+        user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            db.execute("INSERT INTO users (id, balance) VALUES (?, 0)", (user_id,))
+            db.commit()
+            balance = 0
+            log.info(f"[/api/user] Created new user: {user_id}")
+        else:
+            balance = user["balance"]
+            log.info(f"[/api/user] Existing user: {user_id}, balance={balance}")
+
+        return jsonify({"user_id": user_id, "balance": balance})
+
+    except Exception as e:
+        log.exception(f"[/api/user] Unexpected error: {e}")
+        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
 
 @app.route("/api/balance", methods=["GET"])
 def check_balance():
-    user_id = request.args.get("user_id", "").strip()
-    if not user_id:
-        return jsonify({"error": "user_id is required"}), 400
+    try:
+        user_id = request.args.get("user_id", "").strip()
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
 
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    if not user:
-        return jsonify({"error": "User not found"}), 404
+        db   = get_db()
+        user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
 
-    return jsonify({"user_id": user_id, "balance": user["balance"]})
+        return jsonify({"user_id": user_id, "balance": user["balance"]})
+
+    except Exception as e:
+        log.exception(f"[/api/balance] Unexpected error: {e}")
+        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
 
 # --- Admin: Add Balance ---
 @app.route("/api/admin/add-balance", methods=["POST"])
 def admin_add_balance():
-    token = request.headers.get("X-Admin-Token", "")
-    if token != ADMIN_TOKEN:
-        return jsonify({"error": "Unauthorized"}), 403
-
-    data = request.json or {}
-    user_id = (data.get("user_id") or "").strip()
-    amount  = data.get("amount", 0)
-
-    if not user_id:
-        return jsonify({"error": "user_id is required"}), 400
     try:
-        amount = int(amount)
-        if amount <= 0:
-            raise ValueError()
-    except (ValueError, TypeError):
-        return jsonify({"error": "Invalid amount — must be a positive integer"}), 400
+        token = request.headers.get("X-Admin-Token", "")
+        if not ADMIN_TOKEN:
+            return jsonify({"error": "Admin token not configured on server"}), 503
+        if token != ADMIN_TOKEN:
+            log.warning("[/api/admin/add-balance] Unauthorized access attempt.")
+            return jsonify({"error": "Unauthorized"}), 403
 
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    if not user:
-        db.execute("INSERT INTO users (id, balance) VALUES (?, ?)", (user_id, amount))
-    else:
-        db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, user_id))
-    db.commit()
+        data    = get_json_body()
+        user_id = (data.get("user_id") or "").strip()
+        amount  = data.get("amount", 0)
+        log.debug(f"[/api/admin/add-balance] body={data}")
 
-    new_balance = db.execute("SELECT balance FROM users WHERE id = ?", (user_id,)).fetchone()["balance"]
-    return jsonify({"user_id": user_id, "new_balance": new_balance})
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        try:
+            amount = int(amount)
+            if amount <= 0:
+                raise ValueError()
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid amount — must be a positive integer"}), 400
+
+        db   = get_db()
+        user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            db.execute("INSERT INTO users (id, balance) VALUES (?, ?)", (user_id, amount))
+        else:
+            db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, user_id))
+        db.commit()
+
+        new_balance = db.execute(
+            "SELECT balance FROM users WHERE id = ?", (user_id,)
+        ).fetchone()["balance"]
+        log.info(f"[/api/admin/add-balance] Added {amount} to {user_id}. New balance: {new_balance}")
+        return jsonify({"user_id": user_id, "new_balance": new_balance})
+
+    except Exception as e:
+        log.exception(f"[/api/admin/add-balance] Unexpected error: {e}")
+        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
 
 # --- Orders ---
 @app.route("/api/order", methods=["POST"])
 def create_order():
-    data    = request.json or {}
-    user_id = (data.get("user_id") or "").strip()
-    link    = (data.get("link") or "").strip()
-    qty     = data.get("qty", 0)
-
-    if not user_id:
-        return jsonify({"error": "user_id is required"}), 400
-    if not link:
-        return jsonify({"error": "link is required"}), 400
-
     try:
-        qty = int(qty)
-        if qty <= 0:
-            raise ValueError()
-    except (ValueError, TypeError):
-        return jsonify({"error": "qty must be a positive integer"}), 400
+        data    = get_json_body()
+        user_id = (data.get("user_id") or "").strip()
+        link    = (data.get("link") or "").strip()
+        qty     = data.get("qty", 0)
+        log.debug(f"[/api/order] body={data}")
 
-    db   = get_db()
-    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    if not user:
-        return jsonify({"error": "User not found. Please log in first."}), 404
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        if not link:
+            return jsonify({"error": "link is required"}), 400
+        try:
+            qty = int(qty)
+            if qty <= 0:
+                raise ValueError()
+        except (ValueError, TypeError):
+            return jsonify({"error": "qty must be a positive integer"}), 400
 
-    # Pricing: 0.02 credits per unit, minimum 1 credit
-    cost = max(1, int(qty * 0.02))
+        if not API_KEY or not SERVICE_ID:
+            return jsonify({"error": "SMM API is not configured on the server."}), 503
 
-    if user["balance"] < cost:
-        return jsonify({
-            "error": f"Insufficient balance. Need {cost} credits, you have {user['balance']}."
-        }), 402
+        db   = get_db()
+        user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            return jsonify({"error": "User not found. Please log in first."}), 404
 
-    # Call external SMM API
-    try:
-        resp = requests.post(SMM_API_URL, data={
-            "key":      API_KEY,
-            "action":   "add",
-            "service":  SERVICE_ID,
-            "link":     link,
-            "quantity": qty,
-        }, timeout=20)
-        resp_data = resp.json()
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "SMM API timed out. Please try again."}), 504
-    except requests.exceptions.ConnectionError:
-        return jsonify({"error": "Could not reach SMM API. Check your connection."}), 502
+        # Pricing: 0.02 credits per unit, minimum 1 credit
+        cost = max(1, int(qty * 0.02))
+
+        if user["balance"] < cost:
+            return jsonify({
+                "error": f"Insufficient balance. Need {cost} credits, you have {user['balance']}."
+            }), 402
+
+        # Call external SMM API
+        try:
+            resp = requests.post(SMM_API_URL, data={
+                "key":      API_KEY,
+                "action":   "add",
+                "service":  SERVICE_ID,
+                "link":     link,
+                "quantity": qty,
+            }, timeout=20)
+            resp.raise_for_status()
+            resp_data = resp.json()
+        except requests.exceptions.Timeout:
+            return jsonify({"error": "SMM API timed out. Please try again."}), 504
+        except requests.exceptions.ConnectionError:
+            return jsonify({"error": "Could not reach SMM API. Check your connection."}), 502
+        except requests.exceptions.HTTPError as e:
+            return jsonify({"error": f"SMM API HTTP error: {str(e)}"}), 502
+        except Exception as e:
+            return jsonify({"error": f"SMM API request failed: {str(e)}"}), 502
+
+        log.info(f"[/api/order] SMM API response for user={user_id}: {resp_data}")
+
+        if "order" not in resp_data:
+            error_msg = resp_data.get("error", "Unknown error from provider")
+            log.error(f"[/api/order] Missing 'order' key. Full response: {resp_data}")
+            return jsonify({
+                "error": f"SMM provider rejected the order: {error_msg}",
+                "detail": resp_data
+            }), 502
+
+        provider_order_id = str(resp_data["order"])
+
+        db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (cost, user_id))
+        db.execute(
+            "INSERT INTO orders (user_id, link, qty, status, provider_order_id) VALUES (?, ?, ?, 'pending', ?)",
+            (user_id, link, qty, provider_order_id)
+        )
+        db.commit()
+        log.info(f"[/api/order] Order saved. provider_id={provider_order_id}, cost={cost}")
+
+        return jsonify({"success": True, "provider_order_id": provider_order_id, "cost": cost})
+
     except Exception as e:
-        return jsonify({"error": f"SMM API request failed: {str(e)}"}), 502
-
-    # Debug: log full API response to server console
-    print(f"[SMM API response] order for user={user_id}: {resp_data}")
-
-    if "order" not in resp_data:
-        error_msg = resp_data.get("error", "Unknown error from provider")
-        print(f"[SMM API error] Missing 'order' key. Full response: {resp_data}")
-        return jsonify({
-            "error": f"SMM provider rejected the order: {error_msg}",
-            "detail": resp_data
-        }), 502
-
-    provider_order_id = str(resp_data["order"])
-
-    # Deduct balance and save order
-    db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (cost, user_id))
-    db.execute(
-        "INSERT INTO orders (user_id, link, qty, status, provider_order_id) VALUES (?, ?, ?, 'pending', ?)",
-        (user_id, link, qty, provider_order_id)
-    )
-    db.commit()
-
-    return jsonify({"success": True, "provider_order_id": provider_order_id, "cost": cost})
+        log.exception(f"[/api/order] Unexpected error: {e}")
+        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
 
 @app.route("/api/orders", methods=["GET"])
 def list_orders():
-    user_id = request.args.get("user_id", "").strip()
-    if not user_id:
-        return jsonify({"error": "user_id is required"}), 400
+    try:
+        user_id = request.args.get("user_id", "").strip()
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
 
-    db   = get_db()
-    rows = db.execute(
-        "SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 10",
-        (user_id,)
-    ).fetchall()
+        db   = get_db()
+        rows = db.execute(
+            "SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 10",
+            (user_id,)
+        ).fetchall()
 
-    return jsonify({"orders": [dict(r) for r in rows]})
+        return jsonify({"orders": [dict(r) for r in rows]})
+
+    except Exception as e:
+        log.exception(f"[/api/orders] Unexpected error: {e}")
+        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
 
 @app.route("/api/order/status", methods=["GET"])
 def order_status():
-    order_id = request.args.get("order_id", "").strip()
-    user_id  = request.args.get("user_id", "").strip()
-
-    if not order_id or not user_id:
-        return jsonify({"error": "order_id and user_id are required"}), 400
-
-    db    = get_db()
-    order = db.execute(
-        "SELECT * FROM orders WHERE id = ? AND user_id = ?", (order_id, user_id)
-    ).fetchone()
-    if not order:
-        return jsonify({"error": "Order not found"}), 404
-
-    # If no provider ID yet, return stored status
-    if not order["provider_order_id"]:
-        return jsonify({**dict(order), "status": order["status"]})
-
-    # Fetch live status from provider
     try:
-        resp = requests.post(SMM_API_URL, data={
-            "key":    API_KEY,
-            "action": "status",
-            "order":  order["provider_order_id"],
-        }, timeout=20)
-        status_data = resp.json()
-        print(f"[SMM API status] order_id={order_id}: {status_data}")
-        live_status = normalize_status(status_data.get("status", ""))
+        order_id = request.args.get("order_id", "").strip()
+        user_id  = request.args.get("user_id", "").strip()
+
+        if not order_id or not user_id:
+            return jsonify({"error": "order_id and user_id are required"}), 400
+
+        db    = get_db()
+        order = db.execute(
+            "SELECT * FROM orders WHERE id = ? AND user_id = ?", (order_id, user_id)
+        ).fetchone()
+        if not order:
+            return jsonify({"error": "Order not found"}), 404
+
+        if not order["provider_order_id"]:
+            return jsonify({**dict(order), "status": order["status"]})
+
+        # Fetch live status from provider
+        try:
+            resp = requests.post(SMM_API_URL, data={
+                "key":    API_KEY,
+                "action": "status",
+                "order":  order["provider_order_id"],
+            }, timeout=20)
+            status_data = resp.json()
+            log.info(f"[/api/order/status] order_id={order_id}: {status_data}")
+            live_status = normalize_status(status_data.get("status", ""))
+        except Exception as e:
+            log.warning(f"[/api/order/status] Could not fetch from provider: {e}")
+            live_status = order["status"]
+
+        db.execute("UPDATE orders SET status = ? WHERE id = ?", (live_status, order_id))
+        db.commit()
+
+        return jsonify({**dict(order), "status": live_status})
+
     except Exception as e:
-        print(f"[SMM API status error] order_id={order_id}: {str(e)}")
-        live_status = order["status"]
-
-    # Persist updated status
-    db.execute("UPDATE orders SET status = ? WHERE id = ?", (live_status, order_id))
-    db.commit()
-
-    return jsonify({**dict(order), "status": live_status})
+        log.exception(f"[/api/order/status] Unexpected error: {e}")
+        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
 
 if __name__ == "__main__":
-    init_db()
-    app.run(debug=True, port=5000)
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
